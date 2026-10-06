@@ -58,6 +58,47 @@ object MediaController {
         Log.d("MediaController", "Cleared pausedForOtherDevice after timeout, resuming normal playback monitoring")
     }
 
+    /**
+     * How long local audio must play continuously before the app takes over the
+     * AirPods from the other paired device (e.g. iPhone). Transient sounds such
+     * as lock clicks, keyboard taps or notification blips end well before this
+     * window, so they never trigger a hijack and never pause the other device.
+     */
+    private const val TAKEOVER_SUSTAINED_PLAYBACK_MS = 3000L
+    private var sustainedPlaybackTakeOverPending = false
+    private val sustainedPlaybackTakeOverRunnable = Runnable {
+        sustainedPlaybackTakeOverPending = false
+        // Re-check at fire time: only seize focus if audio is STILL playing
+        // after the full window. Anything that stopped earlier was a transient
+        // sound and must not steal the AirPods.
+        if (!recentlyLostOwnership && audioManager.isMusicActive && lastKnownIsMusicActive == true) {
+            Log.d("MediaController", "Audio sustained for ${TAKEOVER_SUSTAINED_PLAYBACK_MS}ms; taking over")
+            ServiceManager.getService()?.takeOver("music")
+        } else {
+            Log.d("MediaController", "Audio did not sustain ${TAKEOVER_SUSTAINED_PLAYBACK_MS}ms; not taking over")
+        }
+    }
+
+    /**
+     * Request a take-over that only fires if local audio keeps playing for
+     * [TAKEOVER_SUSTAINED_PLAYBACK_MS]. Call [cancelSustainedTakeOver] whenever
+     * playback stops or is no longer music/movie content.
+     */
+    private fun scheduleSustainedTakeOver() {
+        if (sustainedPlaybackTakeOverPending) return
+        sustainedPlaybackTakeOverPending = true
+        handler.postDelayed(sustainedPlaybackTakeOverRunnable, TAKEOVER_SUSTAINED_PLAYBACK_MS)
+        Log.d("MediaController", "Scheduled take-over after ${TAKEOVER_SUSTAINED_PLAYBACK_MS}ms of sustained playback")
+    }
+
+    private fun cancelSustainedTakeOver() {
+        if (sustainedPlaybackTakeOverPending) {
+            handler.removeCallbacks(sustainedPlaybackTakeOverRunnable)
+            sustainedPlaybackTakeOverPending = false
+            Log.d("MediaController", "Cancelled pending take-over; playback did not sustain")
+        }
+    }
+
     private var relativeVolume: Boolean = false
     private var conversationalAwarenessVolume: Int = 2
     private var conversationalAwarenessPauseMusic: Boolean = false
@@ -179,13 +220,16 @@ object MediaController {
                         pausedForOtherDevice = false
                         userPlayedTheMedia = true
                         if (!pausedWhileTakingOver) {
-                            ServiceManager.getService()?.takeOver("music")
+                            // Only seize focus after 3s of sustained playback so a
+                            // stray lock/notification sound does not hijack the AirPods.
+                            scheduleSustainedTakeOver()
                         }
                     } else {
                         Log.d("MediaController", "Skipping take-over due to recent ownership loss or no new music/movie")
                     }
                 } else {
                     Log.d("MediaController", "Still not active while pausedForOtherDevice; will clear state after timeout")
+                    cancelSustainedTakeOver()
                 }
 
                 lastKnownIsMusicActive = isActive
@@ -213,11 +257,20 @@ object MediaController {
                 if (lastKnownIsMusicActive != true) {
                     if (!recentlyLostOwnership) {
                         Log.d("MediaController", "Music/movie is active and not pausedWhileTakingOver; requesting takeOver")
-                        ServiceManager.getService()?.takeOver("music")
+                        // Defer the hijack until playback has been sustained for
+                        // 3s; transient sounds (lock clicks etc.) stop before the
+                        // timer fires and never pause the other device.
+                        scheduleSustainedTakeOver()
                     } else {
                         Log.d("MediaController", "Skipping take-over due to recent ownership loss")
                     }
                 }
+            }
+
+            if (!(hasNewMusicOrMovie && isActive)) {
+                // Playback stopped or is no longer music/movie: a pending
+                // take-over no longer has sustained playback behind it.
+                cancelSustainedTakeOver()
             }
 
             lastKnownIsMusicActive = hasNewMusicOrMovie && isActive
