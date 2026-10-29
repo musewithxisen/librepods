@@ -146,6 +146,14 @@ object MediaController {
             val isActive = audioManager.isMusicActive
             Log.d("MediaController", "Playback config changed, iPausedTheMedia: $iPausedTheMedia, isActive: $isActive, pausedForOtherDevice: $pausedForOtherDevice, lastKnownIsMusicActive: $lastKnownIsMusicActive")
 
+            // Cancel eagerly: the debounce and self-action early returns below
+            // would otherwise swallow the stop callback and leave a pending
+            // take-over behind a sound that has already ended. The fire-time
+            // isMusicActive re-check stays as the second line of defence.
+            if (!isActive) {
+                cancelSustainedTakeOver()
+            }
+
             if (NotificationAnnouncementPlayback.isActive()) {
                 val hasActiveMusicOrMovie = configs?.any { config ->
                     config.audioAttributes.contentType ==
@@ -155,6 +163,9 @@ object MediaController {
                 } == true
                 lastKnownIsMusicActive = isActive && hasActiveMusicOrMovie
                 lastPlaybackCallbackAt = now
+                if (!hasActiveMusicOrMovie) {
+                    cancelSustainedTakeOver()
+                }
                 Log.d(
                     "MediaController",
                     "Ignoring playback callback during notification announcement; " +

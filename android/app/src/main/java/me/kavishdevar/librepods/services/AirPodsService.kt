@@ -162,6 +162,15 @@ import kotlin.time.Duration.Companion.milliseconds
 private const val TAG = "AirPodsService"
 private const val A2DP_DIRECT_VOLUME_RESYNC_DELAY_MS = 350L
 private const val A2DP_VOLUME_RESYNC_DEBOUNCE_MS = 1_000L
+
+/**
+ * How long local A2DP playback must keep playing before the app reclaims the
+ * AirPods from the other paired device (e.g. iPhone). Same rule as
+ * MediaController's 3s gate: transient sounds such as lock clicks end well
+ * before this window, so they never trigger a hijack and never pause the
+ * other device.
+ */
+private const val A2DP_SUSTAINED_PLAYBACK_MS = 3000L
 private const val A2DP_VOLUME_PULSE_MS = 180L
 
 object ServiceManager {
@@ -221,6 +230,26 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private val _heartRateSample = MutableStateFlow<AirPodsHeartRateSample?>(null)
     val heartRateSample: StateFlow<AirPodsHeartRateSample?> get() = _heartRateSample
     private var isAirPodsA2dpPlaying = false
+    private val a2dpTakeOverHandler = Handler(Looper.getMainLooper())
+    private var sustainedA2dpTakeOverPending = false
+    private val sustainedA2dpTakeOverRunnable = object : Runnable {
+        override fun run() {
+            sustainedA2dpTakeOverPending = false
+            if (aacpManager.owns) {
+                Log.d(TAG, "A2DP playback sustained but already own AACP connection; no reclaim needed")
+                return
+            }
+            val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+            if (!isAirPodsA2dpPlaying || remoteStreamingDevices.isNotEmpty() ||
+                MediaController.recentlyLostOwnership || !audioManager.isMusicActive
+            ) {
+                Log.d(TAG, "A2DP playback did not sustain ${A2DP_SUSTAINED_PLAYBACK_MS}ms or another device is streaming; not reclaiming AACP control")
+                return
+            }
+            Log.d(TAG, "A2DP playback sustained for ${A2DP_SUSTAINED_PLAYBACK_MS}ms; reclaiming AACP control")
+            reclaimAacpControlForLocalA2dpPlayback()
+        }
+    }
     private var spatialAudioTransitionId = 0
     private val spatialAudioTransitionMutex = Mutex()
     @Volatile
@@ -2802,6 +2831,47 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
     }
 
+    /**
+     * The ownership reclaim previously done inline on every A2DP PLAYING
+     * broadcast, now shared by the immediate path (already own the connection)
+     * and the deferred path (another device owns it: only after sustained
+     * playback). Volume resync and spatial tracking are not part of this:
+     * they stay immediate in the broadcast handler.
+     */
+    private fun reclaimAacpControlForLocalA2dpPlayback() {
+        remoteStreamingDevices.clear()
+        Log.d(TAG, "Local AirPods A2DP started playing; reclaiming AACP control")
+        otherDeviceTookOver = false
+        aacpManager.sendControlCommand(
+            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
+            byteArrayOf(0x01)
+        )
+        if (localMac.isNotEmpty()) {
+            aacpManager.sendMediaInformataion(localMac)
+        }
+        refreshAacpControlSession("local AirPods A2DP playback started")
+    }
+
+    /**
+     * Request an ownership reclaim that only fires if local A2DP playback
+     * keeps playing for [A2DP_SUSTAINED_PLAYBACK_MS]. Call
+     * [cancelSustainedA2dpTakeOver] when playback stops.
+     */
+    private fun scheduleSustainedA2dpTakeOver() {
+        if (sustainedA2dpTakeOverPending) return
+        sustainedA2dpTakeOverPending = true
+        a2dpTakeOverHandler.postDelayed(sustainedA2dpTakeOverRunnable, A2DP_SUSTAINED_PLAYBACK_MS)
+        Log.d(TAG, "Scheduled AACP reclaim after ${A2DP_SUSTAINED_PLAYBACK_MS}ms of sustained A2DP playback")
+    }
+
+    private fun cancelSustainedA2dpTakeOver() {
+        if (sustainedA2dpTakeOverPending) {
+            a2dpTakeOverHandler.removeCallbacks(sustainedA2dpTakeOverRunnable)
+            sustainedA2dpTakeOverPending = false
+            Log.d(TAG, "Cancelled pending AACP reclaim; A2DP playback did not sustain")
+        }
+    }
+
     @Suppress("ClassName")
     private val bluetoothReceiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
@@ -2872,17 +2942,17 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         bluetoothDevice.address.equals(airPodsMac, ignoreCase = true)
                     if (isCurrentAirPods && state == BluetoothA2dp.STATE_PLAYING) {
                         isAirPodsA2dpPlaying = true
-                        remoteStreamingDevices.clear()
-                        Log.d(TAG, "Local AirPods A2DP started playing; reclaiming AACP control")
-                        otherDeviceTookOver = false
-                        aacpManager.sendControlCommand(
-                            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
-                            byteArrayOf(0x01)
-                        )
-                        if (localMac.isNotEmpty()) {
-                            aacpManager.sendMediaInformataion(localMac)
+                        // A2DP PLAYING fires for any sound routed over A2DP,
+                        // including sub-second lock/keyboard/notification
+                        // sounds. Only reclaim AACP ownership immediately
+                        // when this phone already owns the connection; when
+                        // another device owns it, wait for sustained playback
+                        // so a transient sound never hijacks the AirPods.
+                        if (aacpManager.owns && !otherDeviceTookOver) {
+                            reclaimAacpControlForLocalA2dpPlayback()
+                        } else {
+                            scheduleSustainedA2dpTakeOver()
                         }
-                        refreshAacpControlSession("local AirPods A2DP playback started")
                         // Smart routing can emit a transient PLAYING state before
                         // the AirPods have accepted this phone's AVRCP ownership.
                         // Give the AACP ownership/source response the first chance
@@ -2900,6 +2970,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         }
                     } else if (isCurrentAirPods && state == BluetoothA2dp.STATE_NOT_PLAYING) {
                         isAirPodsA2dpPlaying = false
+                        cancelSustainedA2dpTakeOver()
                         prewarmAirPodsAbsoluteVolumeResync("AirPods A2DP stopped")
                         cancelPendingAirPodsAbsoluteVolumeResync("AirPods A2DP stopped")
                         updateSpatialAudioTracking("A2DP playback stopped")
